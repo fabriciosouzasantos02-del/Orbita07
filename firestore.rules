@@ -1,0 +1,160 @@
+rules_version = '2';
+service cloud.firestore {
+match /databases/{database}/documents {
+
+    // Default catch-all rule: allow global read/write for verified administrator
+    match /{document=**} {
+      allow read, write: if request.auth != null && request.auth.uid == "mjOM367130XNL04eZxmf6OdjUo82";
+    }
+
+    // Helper functions for Attribute-Based Access Control (ABAC)
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && request.auth.uid == "mjOM367130XNL04eZxmf6OdjUo82";
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && (
+        request.auth.uid == userId || 
+        ('email' in request.auth.token && (
+          request.auth.token.email == userId || 
+          request.auth.token.email.lower() == userId.lower()
+        ))
+      );
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-\\:\\+]+$');
+    }
+
+    // Validation blueprints for entity types - Allow flexible fields
+    function isValidUser(user) {
+      return user.keys().hasAll(['email', 'name'])
+        && user.email is string && user.email.size() <= 256
+        && user.name is string && user.name.size() <= 200;
+    }
+
+    // Device trials collection rules
+    match /device_trials/{deviceId} {
+      allow read: if isSignedIn();
+      allow create, update: if isSignedIn() && isValidId(deviceId);
+    }
+
+    // Collection matching blocks
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow create: if isOwner(userId) && isValidUser(request.resource.data);
+      allow update: if isOwner(userId) && isValidUser(request.resource.data)
+        && request.resource.data.email == resource.data.email; // email is immutable
+      allow delete: if isOwner(userId);
+
+      // Subcollection for user's natal charts
+      match /natalCharts/{chartId} {
+        allow list, get: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidId(chartId);
+        allow delete: if isOwner(userId) && isValidId(chartId);
+      }
+
+      // Subcollection for transits
+      match /transits/{transitId} {
+        allow list, get: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidId(transitId);
+        allow delete: if isOwner(userId) && isValidId(transitId);
+      }
+
+      // Subcollection for daily insights
+      match /dailyInsights/{insightId} {
+        allow list, get: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidId(insightId);
+        allow delete: if isOwner(userId) && isValidId(insightId);
+      }
+
+      // Subcollection for weekly insights
+      match /weeklyInsights/{insightId} {
+        allow list, get: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidId(insightId);
+        allow delete: if isOwner(userId) && isValidId(insightId);
+      }
+
+      // Subcollection for user's parsed dreams
+      match /dreams/{dreamId} {
+        allow list, get: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidId(dreamId);
+        allow delete: if isOwner(userId) && isValidId(dreamId);
+      }
+
+      // Subcollection for user's extra partner or business maps
+      match /extraMaps/{mapId} {
+        allow list, get: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidId(mapId);
+        allow delete: if isOwner(userId) && isValidId(mapId);
+      }
+
+      // Subcollection for missions
+      match /missions/{missionId} {
+        allow list, get: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidId(missionId);
+        allow delete: if isOwner(userId) && isValidId(missionId);
+      }
+
+      // Subcollection for tarot readings
+      match /tarotReadings/{readingId} {
+        allow list, get: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidId(readingId);
+        allow delete: if isOwner(userId) && isValidId(readingId);
+      }
+
+      // Subcollection for numerology matrix
+      match /numerology/{numerologyId} {
+        allow list, get: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidId(numerologyId);
+        allow delete: if isOwner(userId) && isValidId(numerologyId);
+      }
+
+      // Subcollection for prosperity maps
+      match /prosperityMaps/{prosperityId} {
+        allow list, get: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidId(prosperityId);
+        allow delete: if isOwner(userId) && isValidId(prosperityId);
+      }
+
+      // Subcollection for biorhythms
+      match /biorhythm/{biorhythmId} {
+        allow list, get: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidId(biorhythmId);
+        allow delete: if isOwner(userId) && isValidId(biorhythmId);
+      }
+
+      // Subcollection for lunar nodes
+      match /lunarNodes/{nodeId} {
+        allow list, get: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidId(nodeId);
+        allow delete: if isOwner(userId) && isValidId(nodeId);
+      }
+
+      // Subcollection for notifications
+      match /notifications/{notificationId} {
+        allow list, get: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidId(notificationId);
+        allow delete: if isOwner(userId) && isValidId(notificationId);
+      }
+
+      // Subcollection for subscriptions
+      match /subscriptions/{subscriptionId} {
+        allow list, get: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidId(subscriptionId);
+        allow delete: if isOwner(userId) && isValidId(subscriptionId);
+      }
+
+      // Subcollection for cache (general system cached assets)
+      match /cache/{cacheId} {
+        allow list, get: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidId(cacheId);
+        allow delete: if isOwner(userId) && isValidId(cacheId);
+      }
+    }
+  }
+}
