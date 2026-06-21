@@ -11,6 +11,9 @@ import { Country, State, City } from 'country-state-city';
 import ephemeris from 'ephemeris';
 import Stripe from 'stripe';
 import nodemailer from 'nodemailer';
+import { initializeApp, getApps, getApp } from "firebase/app";
+import { getFirestore, doc, setDoc, addDoc, collection, getDocs, query, where } from "firebase/firestore";
+import fs from 'fs';
 
 dotenv.config();
 
@@ -31,7 +34,12 @@ function getStripeClient(): Stripe | null {
 const app = express();
 const PORT = 3000;
 
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ 
+  limit: '10mb',
+  verify: (req: any, res, buf) => {
+    req.rawBody = buf;
+  }
+}));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
 // Initialize Google Gen AI
@@ -137,16 +145,34 @@ async function generateContentWithFallback(params: {
       // We do up to 2 attempts for a model unless it hits a 429 or 503, in which case we fail fast and move to the next model
       let attempts = params.retries || 2;
       for (let attempt = 1; attempt <= attempts; attempt++) {
+        let timerId: NodeJS.Timeout | undefined;
         try {
           console.log(`[Gemini] Tentando gerar conteúdo usando o modelo: ${modelName} (Tentativa ${attempt}/${attempts})...`);
-          const response = await aiClient.models.generateContent({
+          
+          const apiCall = aiClient.models.generateContent({
             model: modelName,
             contents: params.contents,
             config: params.config,
           });
+          
+          const timeoutPromise = new Promise<never>((_, reject) => {
+            timerId = setTimeout(() => {
+              reject(new Error(`Timeout de 12 segundos excedido para o modelo ${modelName}.`));
+            }, 12000);
+          });
+          
+          const response = await Promise.race([
+            apiCall.then((res) => {
+              if (timerId) clearTimeout(timerId);
+              return res;
+            }),
+            timeoutPromise
+          ]);
+
           console.log(`[Gemini] Sucesso absoluto usando o modelo ${modelName}.`);
           return response;
         } catch (err: any) {
+          if (timerId) clearTimeout(timerId);
           lastError = err;
           const errStr = err?.message || String(err);
           const isQuotaExceeded = errStr.includes("RESOURCE_EXHAUSTED") || 
@@ -187,13 +213,7 @@ async function generateContentWithFallback(params: {
     throw lastError || new Error("Todos os modelos de fallback falharam.");
   };
 
-  // Queue tasks sequentially
-  const nextPromise = activeGeminiPromise.then(
-    () => executeCall(),
-    () => executeCall()
-  );
-  activeGeminiPromise = nextPromise.catch(() => {});
-  return nextPromise;
+  return executeCall();
 }
 
 // Helper to robustly extract and parse JSON from Gemini's response
@@ -273,13 +293,74 @@ function cleanAndParseJSON(text: string): any {
     }
   }
   
+  // Now, let's repair the JSON string before parsing
+  // 1. Unescaped control characters inside strings (like newlines, tabs)
+  // 2. Trailing commas before close-braces or close-brackets
+  let repaired = "";
+  let inStr = false;
+  const len = cleaned.length;
+  for (let i = 0; i < len; i++) {
+    const char = cleaned[i];
+    if (inStr) {
+      if (char === '\\') {
+        // Safe escape bypass to avoid double-escaping
+        repaired += char;
+        if (i + 1 < len) {
+          repaired += cleaned[i + 1];
+          i++;
+        }
+      } else if (char === '"') {
+        inStr = false;
+        repaired += char;
+      } else if (char === '\n') {
+        repaired += '\\n';
+      } else if (char === '\r') {
+        repaired += '\\r';
+      } else if (char === '\t') {
+        repaired += '\\t';
+      } else {
+        repaired += char;
+      }
+    } else {
+      if (char === '"') {
+        inStr = true;
+        repaired += char;
+      } else if (char === ',') {
+        // Lookahead: if the next non-whitespace characters are } or ], we skip this comma!
+        let skipComma = false;
+        let lookAheadIndex = i + 1;
+        while (lookAheadIndex < len) {
+          const nextChar = cleaned[lookAheadIndex];
+          if (nextChar === ' ' || nextChar === '\n' || nextChar === '\r' || nextChar === '\t') {
+            lookAheadIndex++;
+            continue;
+          }
+          if (nextChar === '}' || nextChar === ']') {
+            skipComma = true;
+          }
+          break;
+        }
+        if (!skipComma) {
+          repaired += char;
+        }
+      } else {
+        repaired += char;
+      }
+    }
+  }
+
   try {
-    return JSON.parse(cleaned);
+    return JSON.parse(repaired);
   } catch (err) {
-    console.error("[cleanAndParseJSON] Erro ao analisar o JSON limpo:", err);
-    console.error("[cleanAndParseJSON] Conteúdo original:", text);
-    console.error("[cleanAndParseJSON] Conteúdo limpo tentado:", cleaned);
-    throw err;
+    try {
+      return JSON.parse(cleaned);
+    } catch {
+      console.error("[cleanAndParseJSON] Erro ao analisar o JSON limpo:", err);
+      console.error("[cleanAndParseJSON] Conteúdo original:", text);
+      console.error("[cleanAndParseJSON] Conteúdo limpo tentado:", cleaned);
+      console.error("[cleanAndParseJSON] Conteúdo reparado tentado:", repaired);
+      throw err;
+    }
   }
 }
 
@@ -2986,6 +3067,221 @@ app.post("/api/auth/send-verification-code", async (req, res) => {
   }
 });
 
+// Firebase Webhook Logs, Billing Events, & Authority Activator
+let firebaseBackendApp: any = null;
+let firebaseBackendDb: any = null;
+
+function getBackendDb() {
+  if (!firebaseBackendDb) {
+    try {
+      const configPath = path.join(process.cwd(), 'firebase-applet-config.json');
+      if (fs.existsSync(configPath)) {
+        const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        if (config.apiKey && config.projectId) {
+          if (getApps().length === 0) {
+            firebaseBackendApp = initializeApp(config);
+          } else {
+            firebaseBackendApp = getApp();
+          }
+          const dbId = config.firestoreDatabaseId;
+          if (dbId && dbId !== "(default)") {
+            firebaseBackendDb = getFirestore(firebaseBackendApp, dbId);
+          } else {
+            firebaseBackendDb = getFirestore(firebaseBackendApp);
+          }
+          console.log("[Firebase Backend] Inicializado com sucesso.");
+        }
+      }
+    } catch (e) {
+      console.error("[Firebase Backend] Erro ao inicializar:", e);
+    }
+  }
+  return firebaseBackendDb;
+}
+
+async function activatePremiumForUser(email: string, planId: string, subscriptionId?: string, subscriptionEndDate?: string) {
+  const db = getBackendDb();
+  if (!db) {
+    console.error("[Billing] Database not initialized for premium activation");
+    return;
+  }
+  
+  const mailKey = email.toLowerCase().trim();
+  console.log(`[Billing] Ativando premium para ${mailKey} - Plano: ${planId}`);
+  
+  try {
+    const usersRef = collection(db, "users");
+    const q = query(usersRef, where("email", "==", mailKey));
+    const snap = await getDocs(q);
+    
+    const endDate = subscriptionEndDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    
+    const updateData = {
+      isPremium: true,
+      planId: planId,
+      subscriptionId: subscriptionId || "",
+      subscriptionEndDate: endDate,
+      isSubscribed: true,
+      updatedAt: new Date().toISOString()
+    };
+    
+    if (!snap.empty) {
+      for (const d of snap.docs) {
+        await setDoc(doc(db, "users", d.id), updateData, { merge: true });
+        console.log(`[Billing] Documento atualizado com premium: users/${d.id}`);
+      }
+    } else {
+      console.log(`[Billing] Nenhum usuário encontrado com email ${mailKey}. Criando documento temporário.`);
+      await setDoc(doc(db, "users", mailKey), {
+        email: mailKey,
+        name: "Viajante Estelar",
+        birthDate: "",
+        birthTime: "",
+        birthCity: "",
+        hasCreatedMap: false,
+        scorePoints: 0,
+        ...updateData
+      }, { merge: true });
+    }
+  } catch (e) {
+    console.error(`[Billing] Erro ao ativar premium para ${mailKey}:`, e);
+  }
+}
+
+async function logStripeWebhook(eventId: string, eventType: string, payload: any) {
+  const db = getBackendDb();
+  if (!db) return;
+  try {
+    const webhooksRef = collection(db, "stripe_webhook_logs");
+    await setDoc(doc(webhooksRef, eventId || `wh_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`), {
+      eventType,
+      payload: JSON.stringify(payload),
+      receivedAt: new Date().toISOString()
+    });
+  } catch (e) {
+    console.warn("[Billing Logs] Falha ao logar webhook:", e);
+  }
+}
+
+async function logBillingEvent(email: string, eventType: string, planId: string, details: any) {
+  const db = getBackendDb();
+  if (!db) return;
+  try {
+    const eventsRef = collection(db, "billing_events");
+    await addDoc(eventsRef, {
+      email: email.toLowerCase().trim(),
+      eventType,
+      planId,
+      details,
+      createdAt: new Date().toISOString()
+    });
+  } catch (e) {
+    console.warn("[Billing Logs] Falha ao logar billing event:", e);
+  }
+}
+
+app.post("/api/stripe/webhook", async (req: any, res) => {
+  const sig = req.headers['stripe-signature'];
+  const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  let event: any;
+
+  try {
+    const stripe = getStripeClient();
+    if (stripe && sig && endpointSecret && endpointSecret.trim() !== "") {
+      event = stripe.webhooks.constructEvent(req.rawBody, sig, endpointSecret);
+    } else {
+      event = req.body;
+    }
+  } catch (err: any) {
+    console.error(`[Webhook] Signature verification failed:`, err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  const eventId = event.id;
+  const eventType = event.type;
+  
+  console.log(`[Webhook] Recebido evento Stripe: ${eventType}`);
+  await logStripeWebhook(eventId, eventType, event);
+
+  try {
+    switch (eventType) {
+      case 'checkout.session.completed': {
+        const session = event.data.object;
+        const email = session.metadata?.email || session.customer_details?.email || session.customer_email;
+        const planId = session.metadata?.planId || "premium";
+        const subscriptionId = session.subscription || "";
+        
+        let subscriptionEndDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+        if (subscriptionId && getStripeClient()) {
+          try {
+            const stripe = getStripeClient();
+            const sub = await stripe!.subscriptions.retrieve(subscriptionId);
+            subscriptionEndDate = new Date((sub as any).current_period_end * 1000).toISOString();
+          } catch {}
+        }
+
+        if (email) {
+          await activatePremiumForUser(email, planId, subscriptionId, subscriptionEndDate);
+          await logBillingEvent(email, "ACTIVATION", planId, { session_id: session.id, subscriptionId });
+        }
+        break;
+      }
+      case 'invoice.payment_succeeded': {
+        const _invoice = event.data.object;
+        const subscriptionId = _invoice.subscription;
+        const email = _invoice.customer_email || _invoice.customer_details?.email;
+        const planId = _invoice.lines?.data?.[0]?.metadata?.planId || "premium";
+        
+        let subscriptionEndDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+        if (subscriptionId && getStripeClient()) {
+          try {
+            const stripe = getStripeClient();
+            const sub = await stripe!.subscriptions.retrieve(subscriptionId);
+            subscriptionEndDate = new Date((sub as any).current_period_end * 1000).toISOString();
+          } catch {}
+        }
+
+        if (email) {
+          await activatePremiumForUser(email, planId, subscriptionId, subscriptionEndDate);
+          await logBillingEvent(email, "RENEWAL_SUCCESS", planId, { invoice_id: _invoice.id, subscriptionId });
+        }
+        break;
+      }
+      case 'customer.subscription.deleted': {
+        const sub = event.data.object;
+        const subscriptionId = sub.id;
+        const email = sub.metadata?.email || sub.customer_details?.email;
+        
+        if (email) {
+          const db = getBackendDb();
+          if (db) {
+            const usersRef = collection(db, "users");
+            const q = query(usersRef, where("email", "==", email.toLowerCase().trim()));
+            const snap = await getDocs(q);
+            for (const d of snap.docs) {
+              await setDoc(doc(db, "users", d.id), {
+                isPremium: false,
+                isSubscribed: false,
+                updatedAt: new Date().toISOString()
+              }, { merge: true });
+            }
+          }
+          await logBillingEvent(email, "CANCELLATION", "none", { subscriptionId });
+        }
+        break;
+      }
+      default:
+        console.log(`[Webhook] Evento não tratado explicitamente: ${eventType}`);
+    }
+
+    res.json({ received: true });
+  } catch (error: any) {
+    console.error(`[Webhook Handler Error] Erro ao processar evento:`, error);
+    res.status(500).json({ error: error.message || "Erro interno no processamento do webhook" });
+  }
+});
+
 // Real Stripe Session Creation & Verification Handlers
 app.post("/api/stripe/create-checkout-session", async (req, res) => {
   try {
@@ -3091,6 +3387,10 @@ app.get("/api/stripe/verify-session", async (req, res) => {
     if (session_id.startsWith("mock_session_")) {
       const email = (req.query.email || "usuario@exemplo.com").toString();
       const planId = (req.query.plan_id || "premium").toString();
+      
+      await activatePremiumForUser(email, planId, session_id);
+      await logBillingEvent(email, "VERIFIED_SIMULATED_SESSION", planId, { session_id });
+
       return res.json({
         success: true,
         simulated: true,
@@ -3119,6 +3419,19 @@ app.get("/api/stripe/verify-session", async (req, res) => {
 
     const email = session.metadata?.email || session.customer_details?.email || session.customer_email;
     const planId = session.metadata?.planId || "premium";
+    const subscriptionId = typeof session.subscription === 'string' ? session.subscription : "";
+
+    if (email) {
+      let subscriptionEndDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+      if (subscriptionId) {
+        try {
+          const sub = await stripe.subscriptions.retrieve(subscriptionId);
+          subscriptionEndDate = new Date((sub as any).current_period_end * 1000).toISOString();
+        } catch {}
+      }
+      await activatePremiumForUser(email, planId, subscriptionId, subscriptionEndDate);
+      await logBillingEvent(email, "VERIFIED_REAL_SESSION_BACKUP", planId, { session_id, subscriptionId });
+    }
 
     return res.json({
       success: true,

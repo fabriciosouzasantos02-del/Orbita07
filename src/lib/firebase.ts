@@ -3,7 +3,7 @@ import {
   getFirestore, 
   collection, 
   doc, 
-  getDoc, 
+  getDoc as firestoreGetDoc, 
   setDoc, 
   updateDoc, 
   deleteDoc, 
@@ -13,6 +13,7 @@ import {
   addDoc,
   onSnapshot
 } from "firebase/firestore";
+import { getStorage, ref as storageRef, uploadBytes, getDownloadURL } from "firebase/storage";
 import { 
   getAuth,
   signInWithPopup,
@@ -54,6 +55,28 @@ export interface FirestoreErrorInfo {
       email?: string | null;
     }[];
   }
+}
+
+async function getDocWithTimeout(docRef: any, timeoutMs = 3500): Promise<any> {
+  let timerId: any;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timerId = setTimeout(() => {
+      reject(new Error("Timeout ao acessar banco de dados Firestore (Dispositivo offline ou rede instável)."));
+    }, timeoutMs);
+  });
+  
+  try {
+    return await Promise.race([
+      firestoreGetDoc(docRef),
+      timeoutPromise
+    ]);
+  } finally {
+    clearTimeout(timerId);
+  }
+}
+
+export async function getDoc(docRef: any): Promise<any> {
+  return getDocWithTimeout(docRef);
 }
 
 export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null): void {
@@ -131,7 +154,12 @@ export function getFirestoreDB() {
   if (!dbInstance) {
     const app = getFirebaseApp();
     if (app) {
-      dbInstance = getFirestore(app);
+      const dbId = firebaseAppletConfig.firestoreDatabaseId;
+      if (dbId && dbId !== "(default)") {
+        dbInstance = getFirestore(app, dbId);
+      } else {
+        dbInstance = getFirestore(app);
+      }
     }
   }
   return dbInstance;
@@ -146,6 +174,32 @@ export function getFirebaseAuth() {
     }
   }
   return authInstance;
+}
+
+let storageInstance: any = null;
+
+export function getFirebaseStorage() {
+  if (!hasConfig) return null;
+  if (!storageInstance) {
+    const app = getFirebaseApp();
+    if (app) {
+      storageInstance = getStorage(app);
+    }
+  }
+  return storageInstance;
+}
+
+export async function uploadUserProfilePhoto(email: string, file: File | Blob): Promise<string> {
+  const storage = getFirebaseStorage();
+  if (!storage) {
+    throw new Error("Firebase Storage não foi inicializado.");
+  }
+  
+  const docKey = getUserDocKey(email);
+  const fileRef = storageRef(storage, `user-profiles/${docKey}/profile.jpg`);
+  
+  await uploadBytes(fileRef, file);
+  return getDownloadURL(fileRef);
 }
 
 // Ensure first connection is validated on startup
@@ -266,6 +320,55 @@ export async function saveProfileToDatabase(email: string, profile: UserProfileD
   }
 }
 
+export async function migrateLegacyUserSubcollections(db: any, mailKey: string, uid: string, email: string) {
+  const SUBCOLLECTIONS_TO_MIGRATE = [
+    "natalCharts",
+    "transits",
+    "dailyInsights",
+    "weeklyInsights",
+    "dreams",
+    "extraMaps",
+    "missions",
+    "tarotReadings",
+    "numerology",
+    "prosperityMaps",
+    "biorhythm",
+    "lunarNodes",
+    "notifications",
+    "subscriptions",
+    "cache"
+  ];
+
+  console.log(`[Migration] Iniciando migração de subcoleções de e-mail (${mailKey}) para UID (${uid})`);
+
+  for (const subColName of SUBCOLLECTIONS_TO_MIGRATE) {
+    try {
+      const oldColRef = collection(db, "users", mailKey, subColName);
+      const oldDocsSnap = await getDocs(oldColRef);
+      
+      if (!oldDocsSnap.empty) {
+        console.log(`[Migration] Migrando ${oldDocsSnap.size} documentos da subcoleção "${subColName}" para nova conta`);
+        for (const subDoc of oldDocsSnap.docs) {
+          const data = subDoc.data();
+          // Atualiza links de ID ou de email interno para o novo UID do Auth
+          if (data.userId && (data.userId === mailKey || data.userId.toLowerCase().trim() === email.toLowerCase().trim())) {
+            data.userId = uid;
+          }
+          const newDocRef = doc(db, "users", uid, subColName, subDoc.id);
+          await setDoc(newDocRef, data, { merge: true });
+          
+          // Deleta documento antigo somente após a cópia bem-sucedida para máxima segurança
+          await deleteDoc(subDoc.ref).catch(e => {
+            console.warn(`[Migration] Falha ao remover documento antigo em ${subColName}/${subDoc.id}:`, e);
+          });
+        }
+      }
+    } catch (e) {
+      console.error(`[Migration] Falha ao migrar a subcoleção ${subColName}:`, e);
+    }
+  }
+}
+
 export async function loadProfileFromDatabase(email: string): Promise<UserProfileData | null> {
   const mailKey = email.toLowerCase().trim();
   if (!mailKey) return null;
@@ -280,7 +383,7 @@ export async function loadProfileFromDatabase(email: string): Promise<UserProfil
       const path = `users/${uid}`;
       try {
         const userRef = doc(db, "users", uid);
-        const snap = await getDoc(userRef);
+        const snap = await getDocWithTimeout(userRef);
         if (snap.exists()) {
           const raw = snap.data() as UserProfileData;
           localStorage.setItem("orbi_user_profile", JSON.stringify(raw));
@@ -295,7 +398,7 @@ export async function loadProfileFromDatabase(email: string): Promise<UserProfil
     const emailPath = `users/${mailKey}`;
     try {
       const userRef = doc(db, "users", mailKey);
-      const snap = await getDoc(userRef);
+      const snap = await getDocWithTimeout(userRef);
       if (snap.exists()) {
         const raw = snap.data() as UserProfileData;
         
@@ -309,10 +412,15 @@ export async function loadProfileFromDatabase(email: string): Promise<UserProfil
             userId: uid,
             updatedAt: new Date().toISOString()
           };
+          
+          // 1. Cópia bem-sucedida do documento principal
           await setDoc(newDocRef, migratedProfile, { merge: true });
           
-          // Delete old email-keyed document to maintain high cleanliness
-          await deleteDoc(userRef).catch(e => console.warn("[Migration] Erro ao deletar documento legado:", e));
+          // 2. Cópia de todas as subcoleções (Natal Charts, Dreams, Extra Maps, Tarot, etc.)
+          await migrateLegacyUserSubcollections(db, mailKey, uid, email);
+          
+          // 3. Deleta o documento principal e todas as estruturas antigas apenas pós confirmação
+          await deleteDoc(userRef).catch(e => console.warn("[Migration] Erro ao deletar documento principal legado:", e));
           
           localStorage.setItem("orbi_user_profile", JSON.stringify(migratedProfile));
           return migratedProfile;
@@ -381,7 +489,7 @@ export async function loadCalculationCache(email: string, cacheId: string): Prom
     const path = `users/${docKey}/cache/${cacheId}`;
     try {
       const cacheRef = doc(db, "users", docKey, "cache", cacheId);
-      const snap = await getDoc(cacheRef);
+      const snap = await getDocWithTimeout(cacheRef);
       if (snap.exists()) {
         const docData = snap.data();
         if (docData && docData.data) {
@@ -769,7 +877,7 @@ export async function loadNatalChartFromDatabase(email: string, chartId: string)
     const path = `users/${docKey}/natalCharts/${chartId}`;
     try {
       const docRef = doc(db, "users", docKey, "natalCharts", chartId);
-      const snap = await getDoc(docRef);
+      const snap = await getDocWithTimeout(docRef);
       if (snap.exists()) {
         const data = snap.data();
         localStorage.setItem(`orbi_natal_chart_${docKey}_${chartId}`, JSON.stringify(data));
@@ -1467,41 +1575,59 @@ export async function deleteUserAccountFirebase(email: string): Promise<void> {
   localStorage.removeItem("registered_accounts_data_local");
   
   const db = getFirestoreDB();
+  const auth = getFirebaseAuth();
+  const activeUid = auth?.currentUser?.uid;
+  
+  const keysToDelete = [mailKey];
+  if (activeUid && activeUid !== mailKey) {
+    keysToDelete.push(activeUid);
+  }
+
   if (db) {
-    // Exclui subcoleções de mapas extras
-    try {
-      const extraRef = collection(db, "users", mailKey, "extraMaps");
-      const extraSnap = await getDocs(extraRef);
-      for (const d of extraSnap.docs) {
-        await deleteDoc(doc(db, "users", mailKey, "extraMaps", d.id));
-      }
-    } catch (e) {
-      console.warn("Falha ao deletar mapas extras no Firestore:", e);
-    }
+    const SUBCOLLECTIONS_TO_DELETE = [
+      "natalCharts",
+      "transits",
+      "dailyInsights",
+      "weeklyInsights",
+      "dreams",
+      "extraMaps",
+      "missions",
+      "tarotReadings",
+      "numerology",
+      "prosperityMaps",
+      "biorhythm",
+      "lunarNodes",
+      "notifications",
+      "subscriptions",
+      "cache"
+    ];
 
-    // Exclui subcoleções de sonhos
-    try {
-      const dreamsRef = collection(db, "users", mailKey, "dreams");
-      const dreamsSnap = await getDocs(dreamsRef);
-      for (const d of dreamsSnap.docs) {
-        await deleteDoc(doc(db, "users", mailKey, "dreams", d.id));
+    for (const key of keysToDelete) {
+      // Exclui todas as subcoleções
+      for (const subCol of SUBCOLLECTIONS_TO_DELETE) {
+        try {
+          const colRef = collection(db, "users", key, subCol);
+          const snap = await getDocs(colRef);
+          for (const d of snap.docs) {
+            await deleteDoc(doc(db, "users", key, subCol, d.id));
+          }
+        } catch (e) {
+          console.warn(`Falha ao deletar subcoleção ${subCol} para a chave ${key}:`, e);
+        }
       }
-    } catch (e) {
-      console.warn("Falha ao deletar sonhos no Firestore:", e);
-    }
 
-    // Exclui o documento principal do usuário
-    try {
-      const userRef = doc(db, "users", mailKey);
-      await deleteDoc(userRef);
-    } catch (e) {
-      console.warn("Falha ao deletar perfil principal no Firestore:", e);
-      handleFirestoreError(e, OperationType.DELETE, `users/${mailKey}`);
+      // Exclui o documento principal do usuário
+      try {
+        const userRef = doc(db, "users", key);
+        await deleteDoc(userRef);
+      } catch (e) {
+        console.warn(`Falha ao deletar perfil principal para a chave ${key}:`, e);
+        handleFirestoreError(e, OperationType.DELETE, `users/${key}`);
+      }
     }
   }
 
   // Exclui a credencial de autenticação se houver login ativo no Firebase Auth
-  const auth = getFirebaseAuth();
   if (auth && auth.currentUser) {
     try {
       await auth.currentUser.delete();

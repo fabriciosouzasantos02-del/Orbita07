@@ -38,6 +38,7 @@ import { SIGNS_ZODIAC_LIST, BLOG_ARTICLES_LIST, FAQ_LIST } from './data';
 import { 
   saveProfileToDatabase, 
   loadProfileFromDatabase, 
+  uploadUserProfilePhoto, 
   saveExtraMapToDatabase, 
   deleteExtraMapFromDatabase, 
   loadExtraMapsFromDatabase, 
@@ -653,18 +654,23 @@ export default function App() {
         let targetUser: UserProfile;
 
         if (existingProfile) {
-          const finalBirthCity = loginBirthCity.trim() || existingProfile.birthCity || "";
+          const birthDateToUse = existingProfile.birthDate || createMainDate || "";
+          const birthTimeToUse = existingProfile.birthTime || (createMainDate && createMainTime ? createMainTime : (timeIsUnknown ? "12:00" : "")) || "";
+          const birthCityToUse = existingProfile.birthCity || createMainCity || loginBirthCity.trim() || "";
+          const isUnknownTimeToUse = existingProfile.isUnknownTime ?? (createMainDate ? timeIsUnknown : false);
+          const hasProvidedData = !!birthDateToUse && !!birthCityToUse;
+
           const forceTrialUsed = (!checkStatus.isAllowed && !existingProfile.isSubscribed);
 
           targetUser = {
             userId: firebaseUser.uid,
-            name: existingProfile.name || firebaseUser.displayName || "Viajante Estelar",
-            birthDate: existingProfile.birthDate || "",
-            birthTime: existingProfile.birthTime || "",
-            birthCity: finalBirthCity,
-            isUnknownTime: existingProfile.isUnknownTime ?? false,
+            name: createMainName.trim() || existingProfile.name || firebaseUser.displayName || "Viajante Estelar",
+            birthDate: birthDateToUse,
+            birthTime: birthTimeToUse,
+            birthCity: birthCityToUse,
+            isUnknownTime: isUnknownTimeToUse,
             isPremium: existingProfile.isPremium ?? true,
-            hasCreatedMap: existingProfile.hasCreatedMap ?? (existingProfile.birthDate ? true : false),
+            hasCreatedMap: hasProvidedData,
             email: emailLower,
             scorePoints: existingProfile.scorePoints ?? 0,
             profilePhoto: existingProfile.profilePhoto || firebaseUser.photoURL,
@@ -679,14 +685,16 @@ export default function App() {
             deviceFingerprint: checkStatus.fingerprint,
             lastLoginAt: new Date().toISOString(),
             isSubscribed: existingProfile.isSubscribed ?? false,
-            subscriptionEndDate: existingProfile.subscriptionEndDate || ""
+            subscriptionEndDate: existingProfile.subscriptionEndDate || "",
+            latitude: existingProfile.latitude || createMainCoords?.latitude || user.latitude,
+            longitude: existingProfile.longitude || createMainCoords?.longitude || user.longitude
           };
 
           await saveProfileToDatabase(emailLower, targetUser as any);
           if (forceTrialUsed) {
             triggerGlobalNotification("Período de Teste Concluído", "Este dispositivo já utilizou o período gratuito. Ative uma assinatura para continuar.", "alert");
           } else {
-            triggerGlobalNotification("Bem-vindo de Volta", `Olá, ${existingProfile.name || "Buscador"}! Conexão cósmica restaurada.`, "success");
+            triggerGlobalNotification("Bem-vindo de Volta", `Olá, ${targetUser.name || "Buscador"}! Conexão cósmica restaurada.`, "success");
           }
         } else {
           // New Google account flow
@@ -744,6 +752,8 @@ export default function App() {
 
         if (targetUser.hasCreatedMap) {
           triggerGenerateMainMap(targetUser);
+          setMapSubTab('meu_mapa');
+          setActiveTab('mapa');
         } else if (loginBirthCity.trim() && targetUser.birthDate) {
           triggerGenerateMainMap({
             name: targetUser.name,
@@ -752,6 +762,11 @@ export default function App() {
             birthCity: loginBirthCity.trim(),
             isUnknownTime: targetUser.isUnknownTime
           });
+          setMapSubTab('meu_mapa');
+          setActiveTab('mapa');
+        } else {
+          setMapSubTab('criar_meu_mapa');
+          setActiveTab('mapa');
         }
       }
     } catch (err: any) {
@@ -941,6 +956,21 @@ export default function App() {
         console.log("[Auth] Firebase native register transacted.", firebaseUser?.uid);
       } catch (fbErr: any) {
         console.error("[Auth] Firebase auth register deferred.", fbErr);
+        const isEmailInUse = 
+          fbErr.code === "auth/email-already-in-use" || 
+          fbErr.message?.includes("email-already-in-use") || 
+          String(fbErr).includes("email-already-in-use");
+
+        if (isEmailInUse) {
+          triggerGlobalNotification(
+            "Conta Existente", 
+            "Este e-mail já possui uma conta cadastrada. Redirecionando para a tela de login...", 
+            "info"
+          );
+          setAuthTab('login');
+          return;
+        }
+
         const errorMsg = fbErr.message || "Erro no cadastro. Verifique a senha (mínimo 6 caracteres).";
         triggerGlobalNotification("Erro de Cadastro", errorMsg, "alert");
         if (fbErr.message?.includes('operation-not-allowed') || fbErr.code?.includes('operation-not-allowed') || String(fbErr).includes('operation-not-allowed')) {
@@ -1042,6 +1072,11 @@ export default function App() {
 
       if (hasProvidedData) {
         triggerGenerateMainMap(newUserProfile);
+        setMapSubTab('meu_mapa');
+        setActiveTab('mapa');
+      } else {
+        setMapSubTab('criar_meu_mapa');
+        setActiveTab('mapa');
       }
     } finally {
       setTimeout(() => {
@@ -1199,6 +1234,8 @@ export default function App() {
 
       if (targetUser.hasCreatedMap) {
         triggerGenerateMainMap(targetUser);
+        setMapSubTab('meu_mapa');
+        setActiveTab('mapa');
         triggerGlobalNotification("Portal Órbita", `Sessão restaurada para ${targetUser.name}! Coordenadas sintonizadas.`, "success");
       } else if (loginBirthCity.trim() && targetUser.birthDate) {
         triggerGenerateMainMap({
@@ -1208,8 +1245,12 @@ export default function App() {
           birthCity: loginBirthCity.trim(),
           isUnknownTime: targetUser.isUnknownTime
         });
+        setMapSubTab('meu_mapa');
+        setActiveTab('mapa');
         triggerGlobalNotification("Portal Órbita", `Sessão iniciada e mapa gerado para a cidade de nascimento: ${loginBirthCity.trim()}!`, "success");
       } else {
+        setMapSubTab('criar_meu_mapa');
+        setActiveTab('mapa');
         triggerGlobalNotification("Portal Órbita", `Conexão cósmica sintonizada. Bem-vindo!`, "success");
       }
     } finally {
@@ -1336,6 +1377,7 @@ export default function App() {
 
   // Firebase Real-time listeners hook
   useEffect(() => {
+    if (!isAuthInitialized) return;
     if (!isLoggedIn || !loggedEmail) return;
 
     // 1. User Profile Real-time Sync
@@ -1514,10 +1556,12 @@ export default function App() {
 
   const profileLoadedRef = useRef(false);
   const manualAuthActionRef = useRef(false);
+  const [isAuthInitialized, setIsAuthInitialized] = useState<boolean>(false);
 
   // Firebase Auth session observer hook
   useEffect(() => {
     const unsubAuth = subscribeToAuthChanges((firebaseUser) => {
+      setIsAuthInitialized(true);
       if (firebaseUser && firebaseUser.email) {
         const emailLower = firebaseUser.email.toLowerCase().trim();
         console.log("[Auth Observer] Usuário do Firebase autenticado:", emailLower);
@@ -1539,8 +1583,15 @@ export default function App() {
           profileLoadedRef.current = true;
           loadProfileFromDatabase(emailLower).then((cloudProfile) => {
             if (cloudProfile) {
+              let rawName = cloudProfile.name || firebaseUser.displayName || "";
+              if (!rawName.trim() || rawName === "Viajante Estelar") {
+                const emailPrefix = emailLower.split("@")[0];
+                rawName = emailPrefix
+                  .replace(/[\._\-]/g, " ")
+                  .replace(/\b\w/g, l => l.toUpperCase());
+              }
               const updatedUser = {
-                name: cloudProfile.name || "Viajante Estelar",
+                name: rawName || "Viajante Estelar",
                 birthDate: cloudProfile.birthDate || "",
                 birthTime: cloudProfile.birthTime || "",
                 birthCity: cloudProfile.birthCity || "",
@@ -1549,7 +1600,7 @@ export default function App() {
                 hasCreatedMap: cloudProfile.hasCreatedMap ?? (cloudProfile.birthDate ? true : false),
                 email: emailLower,
                 scorePoints: cloudProfile.scorePoints ?? 0,
-                profilePhoto: cloudProfile.profilePhoto,
+                profilePhoto: cloudProfile.profilePhoto || firebaseUser.photoURL || "",
                 isSubscribed: cloudProfile.isSubscribed ?? false,
                 subscriptionEndDate: cloudProfile.subscriptionEndDate || "",
                 emailVerified: cloudProfile.emailVerified ?? cloudProfile.isEmailVerified ?? firebaseUser.emailVerified,
@@ -1575,7 +1626,12 @@ export default function App() {
               saveRegisteredAccounts(accounts);
 
               if (updatedUser.hasCreatedMap) {
+                setMapSubTab('meu_mapa');
+                setActiveTab('mapa');
                 triggerGenerateMainMap(updatedUser);
+              } else {
+                setMapSubTab('criar_meu_mapa');
+                setActiveTab('mapa');
               }
             } else {
               // No profile on database yet. If local has it, save it
@@ -1586,10 +1642,24 @@ export default function App() {
                   if (parsed && parsed.email?.toLowerCase().trim() === emailLower) {
                     saveProfileToDatabase(emailLower, parsed).catch(console.warn);
                     if (parsed.hasCreatedMap) {
+                      setMapSubTab('meu_mapa');
+                      setActiveTab('mapa');
                       triggerGenerateMainMap(parsed);
+                    } else {
+                      setMapSubTab('criar_meu_mapa');
+                      setActiveTab('mapa');
                     }
+                  } else {
+                    setMapSubTab('criar_meu_mapa');
+                    setActiveTab('mapa');
                   }
-                } catch {}
+                } catch {
+                  setMapSubTab('criar_meu_mapa');
+                  setActiveTab('mapa');
+                }
+              } else {
+                setMapSubTab('criar_meu_mapa');
+                setActiveTab('mapa');
               }
             }
           }).catch((err) => {
@@ -1600,9 +1670,20 @@ export default function App() {
               try {
                 const parsed = JSON.parse(activeProfile);
                 if (parsed && parsed.hasCreatedMap) {
+                  setMapSubTab('meu_mapa');
+                  setActiveTab('mapa');
                   triggerGenerateMainMap(parsed);
+                } else {
+                  setMapSubTab('criar_meu_mapa');
+                  setActiveTab('mapa');
                 }
-              } catch {}
+              } catch {
+                setMapSubTab('criar_meu_mapa');
+                setActiveTab('mapa');
+              }
+            } else {
+              setMapSubTab('criar_meu_mapa');
+              setActiveTab('mapa');
             }
           });
         }
@@ -4169,20 +4250,40 @@ export default function App() {
                     accept="image/*"
                     id="profile-avatar-top-file-input"
                     className="hidden"
-                    onChange={(e) => {
+                    onChange={async (e) => {
                       const file = e.target.files?.[0];
                       if (file) {
-                        const reader = new FileReader();
-                        reader.onloadend = () => {
-                          const base64String = reader.result as string;
-                          const nextUser = { ...user, profilePhoto: base64String };
-                          setUser(nextUser);
+                        try {
+                          let photoUrl = "";
                           if (isLoggedIn && loggedEmail) {
-                            saveProfileToDatabase(loggedEmail, nextUser).catch(console.error);
-                            triggerGlobalNotification("Astro Avatar", "Foto de perfil atualizada com sucesso no portal!", "info");
+                            photoUrl = await uploadUserProfilePhoto(loggedEmail, file);
+                          } else {
+                            const reader = new FileReader();
+                            reader.onloadend = () => {
+                              const base64String = reader.result as string;
+                              const nextUser = { ...user, profilePhoto: base64String };
+                              setUser(nextUser);
+                            };
+                            reader.readAsDataURL(file);
+                            return;
                           }
-                        };
-                        reader.readAsDataURL(file);
+                          const nextUser = { ...user, profilePhoto: photoUrl };
+                          setUser(nextUser);
+                          await saveProfileToDatabase(loggedEmail, nextUser);
+                          triggerGlobalNotification("Astro Avatar", "Foto de perfil atualizada com sucesso no portal!", "info");
+                        } catch (err) {
+                          console.warn("[Storage Upload] Fallback para leitura local:", err);
+                          const reader = new FileReader();
+                          reader.onloadend = () => {
+                            const base64String = reader.result as string;
+                            const nextUser = { ...user, profilePhoto: base64String };
+                            setUser(nextUser);
+                            if (isLoggedIn && loggedEmail) {
+                              saveProfileToDatabase(loggedEmail, nextUser).catch(console.error);
+                            }
+                          };
+                          reader.readAsDataURL(file);
+                        }
                       }
                     }}
                   />
@@ -4389,21 +4490,42 @@ export default function App() {
                                   type="file" 
                                   accept="image/*" 
                                   className="hidden" 
-                                  onChange={(e) => {
+                                  onChange={async (e) => {
                                     const file = e.target.files?.[0];
                                     if (file) {
-                                      const reader = new FileReader();
-                                      reader.onloadend = () => {
-                                        const base64 = reader.result as string;
+                                      try {
+                                        let photoUrl = "";
+                                        if (isLoggedIn && loggedEmail) {
+                                          photoUrl = await uploadUserProfilePhoto(loggedEmail, file);
+                                        } else {
+                                          const reader = new FileReader();
+                                          reader.onloadend = () => {
+                                            const base64 = reader.result as string;
+                                            setUser(prev => ({ ...prev, profilePhoto: base64 }));
+                                          };
+                                          reader.readAsDataURL(file);
+                                          return;
+                                        }
                                         setUser(prev => {
-                                          const next = { ...prev, profilePhoto: base64 };
-                                          if (loggedEmail) {
-                                            saveProfileToDatabase(loggedEmail, next).catch(console.error);
-                                          }
+                                          const next = { ...prev, profilePhoto: photoUrl };
+                                          saveProfileToDatabase(loggedEmail, next).catch(console.error);
                                           return next;
                                         });
-                                      };
-                                      reader.readAsDataURL(file);
+                                      } catch (err) {
+                                        console.warn("[Storage Upload] Fallback para leitura local:", err);
+                                        const reader = new FileReader();
+                                        reader.onloadend = () => {
+                                          const base64 = reader.result as string;
+                                          setUser(prev => {
+                                            const next = { ...prev, profilePhoto: base64 };
+                                            if (loggedEmail) {
+                                              saveProfileToDatabase(loggedEmail, next).catch(console.error);
+                                            }
+                                            return next;
+                                          });
+                                        };
+                                        reader.readAsDataURL(file);
+                                      }
                                     }
                                   }} 
                                 />
@@ -5162,7 +5284,9 @@ export default function App() {
                             name: createMainName,
                             birthDate: createMainDate,
                             birthTime: createMainTime || "12:00",
-                            birthCity: createMainCity
+                            birthCity: createMainCity,
+                            latitude: createMainCoords?.latitude,
+                            longitude: createMainCoords?.longitude
                           });
                           setMapSubTab('meu_mapa'); // switch straight to read-only view
                         }} className="space-y-4 pt-2">
@@ -5204,12 +5328,13 @@ export default function App() {
 
                               <div>
                                 <label className="block text-[10px] font-mono text-slate-400 mb-1 uppercase font-bold">Cidade / Estado</label>
-                                <input
-                                  type="text"
+                                <CityAutocomplete
                                   value={createMainCity}
-                                  onChange={(e) => setCreateMainCity(e.target.value)}
-                                  className="w-full px-3 py-2.5 rounded-xl bg-slate-950 border border-slate-850 text-xs text-slate-205 focus:outline-hidden"
-                                  placeholder="e.g. São Paulo, SP"
+                                  onChange={(val) => setCreateMainCity(val)}
+                                  onSelectCity={(city) => {
+                                    setCreateMainCity(city.label);
+                                    setCreateMainCoords({ latitude: city.latitude, longitude: city.longitude });
+                                  }}
                                 />
                               </div>
                             </div>
